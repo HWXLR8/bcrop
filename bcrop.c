@@ -1247,9 +1247,11 @@ static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
     struct app *app = data;
     (void)toplevel;
     (void)states;
-    if (width > 0 && height > 0) {
+    if (width > 0 && height > 0 &&
+        (width != app->width || height != app->height)) {
         app->width = width;
         app->height = height;
+        app->fitted = false;
         app->dirty = true;
     }
 }
@@ -1555,6 +1557,7 @@ int main(int argc, char **argv)
     xdg_toplevel_add_listener(app.toplevel, &toplevel_listener, &app);
     xdg_toplevel_set_title(app.toplevel, "bcrop");
     xdg_toplevel_set_app_id(app.toplevel, "bcrop");
+    xdg_toplevel_set_fullscreen(app.toplevel, NULL);
     wl_surface_commit(app.surface);
 
     while (app.running) {
