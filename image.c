@@ -483,6 +483,7 @@ static int load_jpeg(struct image *image, struct file_data file,
     jpeg_finish_decompress(&decompress);
     jpeg_destroy_decompress(&decompress);
     image->frame_count = 1;
+    image->frames[0].opaque = true;
     image->format = IMAGE_JPEG;
     image->codec = codec;
     return 0;
@@ -745,6 +746,7 @@ static int load_png(struct image *image, struct file_data file,
         codec->have_time = true;
     }
 
+    image->frames[0].opaque = true;
     for (int y = 0; y < image->height; y++) {
         const uint8_t *row_data = row_pointers[y];
         for (int x = 0; x < image->width; x++) {
@@ -786,6 +788,8 @@ static int load_png(struct image *image, struct file_data file,
             }
             image->frames[0].pixels[(size_t)y * image->width + x] =
                 (uint32_t)a << 24 | (uint32_t)r << 16 | (uint32_t)g << 8 | b;
+            if (a != 255)
+                image->frames[0].opaque = false;
         }
     }
     free((void *)row_pointers);
@@ -1090,8 +1094,12 @@ static int load_webp(struct image *image, struct file_data file,
             set_error(error, error_size, "out of memory");
             goto fail;
         }
-        for (size_t p = 0; p < pixel_count; p++)
+        image->frames[i].opaque = true;
+        for (size_t p = 0; p < pixel_count; p++) {
             image->frames[i].pixels[p] = rgba_to_argb(rgba + p * 4);
+            if (rgba[p * 4 + 3] != 255)
+                image->frames[i].opaque = false;
+        }
         image->frames[i].duration_ms = timestamp - previous_timestamp;
         if (image->frames[i].duration_ms < 0) {
             set_error(error, error_size, "invalid WebP frame timing");
@@ -1753,6 +1761,11 @@ void image_free(struct image *image)
 const uint32_t *image_pixels(const struct image *image)
 {
     return image->frames[image->current_frame].pixels;
+}
+
+bool image_opaque(const struct image *image)
+{
+    return image->frame_count && image->frames[image->current_frame].opaque;
 }
 
 bool image_animated(const struct image *image)

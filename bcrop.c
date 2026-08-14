@@ -62,6 +62,7 @@ struct app {
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
+    struct wl_callback *frame_callback;
     struct xkb_context *xkb_context;
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
@@ -336,10 +337,16 @@ static void fill_rect(int x, int y, int width, int height, int max_width, int ma
     y = clamp_int(y, 0, max_height);
     if (x2 <= x || y2 <= y)
         return;
+    bool opaque = (draw_color >> 24) == 255;
     for (int row = y; row < y2; row++) {
         uint32_t *pixel = draw_pixels + (size_t)row * draw_stride + x;
-        for (int column = x; column < x2; column++, pixel++)
-            *pixel = blend_pixel(*pixel, draw_color);
+        if (opaque) {
+            for (int column = x; column < x2; column++, pixel++)
+                *pixel = draw_color;
+        } else {
+            for (int column = x; column < x2; column++, pixel++)
+                *pixel = blend_pixel(*pixel, draw_color);
+        }
     }
 }
 
@@ -455,59 +462,55 @@ static void draw_status(struct app *app, int width, int height)
     draw_text(app->status, pad, pad, glyph_scale);
 }
 
-static uint32_t bilinear_sample(const uint32_t *source, int width, int height,
-                                double x, double y)
+static uint32_t darken_pixel(uint32_t pixel)
 {
-    x = clamp_double(x, 0.0, width - 1.0);
-    y = clamp_double(y, 0.0, height - 1.0);
-    int x0 = clamp_int((int)floor(x), 0, width - 1);
-    int y0 = clamp_int((int)floor(y), 0, height - 1);
-    int x1 = clamp_int(x0 + 1, 0, width - 1);
-    int y1 = clamp_int(y0 + 1, 0, height - 1);
-    double fx = x - floor(x);
-    double fy = y - floor(y);
-    double weights[4] = {(1.0 - fx) * (1.0 - fy), fx * (1.0 - fy),
-                         (1.0 - fx) * fy, fx * fy};
-    uint32_t pixels[4] = {source[(size_t)y0 * width + x0],
-                          source[(size_t)y0 * width + x1],
-                          source[(size_t)y1 * width + x0],
-                          source[(size_t)y1 * width + x1]};
-    double alpha = 0.0, red = 0.0, green = 0.0, blue = 0.0;
-    for (size_t i = 0; i < 4; i++) {
-        double a = (pixels[i] >> 24) * weights[i];
-        alpha += a;
-        red += ((pixels[i] >> 16) & 255) * a;
-        green += ((pixels[i] >> 8) & 255) * a;
-        blue += (pixels[i] & 255) * a;
-    }
-    if (alpha <= 0.0)
-        return 0;
-    return (uint32_t)lrint(alpha) << 24 |
-           (uint32_t)lrint(red / alpha) << 16 |
-           (uint32_t)lrint(green / alpha) << 8 |
-           (uint32_t)lrint(blue / alpha);
+    unsigned int alpha = pixel >> 24;
+    unsigned int red = (((pixel >> 16) & 255) * 105 + 127) / 255;
+    unsigned int green = (((pixel >> 8) & 255) * 105 + 127) / 255;
+    unsigned int blue = ((pixel & 255) * 105 + 127) / 255;
+    return alpha << 24 | red << 16 | green << 8 | blue;
 }
 
-static void draw_scaled_image(struct app *app, int x, int y, int width, int height)
+static void draw_scaled_image(struct app *app, int x, int y, int width, int height,
+                              int crop_x, int crop_y, int crop_width,
+                              int crop_height)
 {
     const uint32_t *source = image_pixels(&app->image);
+    bool opaque = image_opaque(&app->image);
     int left = clamp_int(x, 0, draw_stride);
     int top = clamp_int(y, 0, draw_height);
     int right = clamp_int(x + width, 0, draw_stride);
     int bottom = clamp_int(y + height, 0, draw_height);
+    int crop_right = crop_x + crop_width;
+    int crop_bottom = crop_y + crop_height;
 
     if (width <= 0 || height <= 0)
         return;
+    uint64_t x_step = ((uint64_t)(unsigned int)app->image_width << 32) /
+                      (unsigned int)width;
+    uint64_t y_step = ((uint64_t)(unsigned int)app->image_height << 32) /
+                      (unsigned int)height;
+    uint64_t first_x = (uint64_t)(unsigned int)(left - x) * x_step + x_step / 2;
+    uint64_t source_y = (uint64_t)(unsigned int)(top - y) * y_step + y_step / 2;
     for (int destination_y = top; destination_y < bottom; destination_y++) {
-        double source_y = ((destination_y - y + 0.5) * app->image_height / height) - 0.5;
+        int source_row = (int)(source_y >> 32);
+        const uint32_t *source_pixels = source +
+            (size_t)source_row * app->image_width;
+        uint32_t *destination = draw_pixels +
+            (size_t)destination_y * draw_stride + left;
+        uint64_t source_x = first_x;
         for (int destination_x = left; destination_x < right; destination_x++) {
-            double source_x = ((destination_x - x + 0.5) * app->image_width / width) - 0.5;
-            uint32_t pixel = bilinear_sample(source, app->image_width,
-                                             app->image_height, source_x, source_y);
-            uint32_t *destination = draw_pixels +
-                (size_t)destination_y * draw_stride + destination_x;
-            *destination = blend_pixel(*destination, pixel);
+            int source_column = (int)(source_x >> 32);
+            uint32_t pixel = source_pixels[source_column];
+            bool selected = destination_x >= crop_x && destination_x < crop_right &&
+                            destination_y >= crop_y && destination_y < crop_bottom;
+            if (!selected)
+                pixel = darken_pixel(pixel);
+            *destination = opaque ? pixel : blend_pixel(*destination, pixel);
+            destination++;
+            source_x += x_step;
         }
+        source_y += y_step;
     }
 }
 
@@ -529,15 +532,12 @@ static void render(struct app *app, struct buffer *buffer)
     draw_pixels = buffer->pixels;
     draw_stride = width;
     draw_height = height;
-    set_color(25, 25, 25, 255);
+    set_color(10, 10, 10, 255);
     fill_rect(0, 0, width, height, width, height);
-    draw_scaled_image(app, image_x, image_y, image_w, image_h);
-
-    set_color(0, 0, 0, 150);
-    fill_rect(0, 0, width, crop_y, width, height);
-    fill_rect(0, crop_y + crop_h, width, height - crop_y - crop_h, width, height);
-    fill_rect(0, crop_y, crop_x, crop_h, width, height);
-    fill_rect(crop_x + crop_w, crop_y, width - crop_x - crop_w, crop_h, width, height);
+    set_color(25, 25, 25, 255);
+    fill_rect(crop_x, crop_y, crop_w, crop_h, width, height);
+    draw_scaled_image(app, image_x, image_y, image_w, image_h,
+                      crop_x, crop_y, crop_w, crop_h);
 
     set_color(255, 255, 255, 255);
     fill_rect(crop_x, crop_y, crop_w, line, width, height);
@@ -562,11 +562,28 @@ static void render(struct app *app, struct buffer *buffer)
 
 }
 
+static void frame_done(void *data, struct wl_callback *callback,
+                       uint32_t callback_data)
+{
+    struct app *app = data;
+    (void)callback_data;
+
+    if (app->frame_callback == callback)
+        app->frame_callback = NULL;
+    wl_callback_destroy(callback);
+    if (app->dirty)
+        redraw(app);
+}
+
+static const struct wl_callback_listener frame_listener = {
+    .done = frame_done,
+};
+
 static void redraw(struct app *app)
 {
     struct buffer *buffer = NULL;
 
-    if (!app->running || !app->configured || !app->dirty)
+    if (!app->running || !app->configured || !app->dirty || app->frame_callback)
         return;
     if (!ensure_buffers(app))
         return;
@@ -580,6 +597,18 @@ static void redraw(struct app *app)
         return;
 
     render(app, buffer);
+    app->frame_callback = wl_surface_frame(app->surface);
+    if (!app->frame_callback ||
+        wl_callback_add_listener(app->frame_callback, &frame_listener, app) < 0) {
+        if (app->frame_callback) {
+            wl_callback_destroy(app->frame_callback);
+            app->frame_callback = NULL;
+        }
+        fprintf(stderr, "bcrop: cannot request compositor frame callback\n");
+        app->running = false;
+        app->exit_status = 1;
+        return;
+    }
     buffer->busy = true;
     wl_surface_set_buffer_scale(app->surface, app->scale);
     wl_surface_attach(app->surface, buffer->wl, 0, 0);
@@ -1292,6 +1321,8 @@ static const struct wl_registry_listener registry_listener = {
 
 static void cleanup(struct app *app)
 {
+    if (app->frame_callback)
+        wl_callback_destroy(app->frame_callback);
     if (app->toplevel)
         xdg_toplevel_destroy(app->toplevel);
     if (app->xdg_surface)

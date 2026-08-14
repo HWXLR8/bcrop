@@ -15,6 +15,7 @@ struct image_frame {
     uint32_t *pixels;
     int duration_ms;
     bool lossless;
+    bool opaque;
     float quality;
 };
 
@@ -33,6 +34,7 @@ struct image {
 int image_load(struct image *image, const char *path, char *error, size_t error_size);
 void image_free(struct image *image);
 const uint32_t *image_pixels(const struct image *image);
+bool image_opaque(const struct image *image);
 bool image_animated(const struct image *image);
 int image_advance(struct image *image);
 int image_current_duration(const struct image *image);
