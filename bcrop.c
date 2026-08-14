@@ -1484,9 +1484,13 @@ int main(int argc, char **argv)
     }
     app.input_path = argv[optind];
     const char *destination = app.output_path ? app.output_path : app.input_path;
+    if (!app.output_path && !app.force) {
+        fprintf(stderr, "no output file specified; use -f to overwrite or -o "
+                        "to specify one\n");
+        return 2;
+    }
     if (!app.force && lstat(destination, &destination_stat) == 0) {
-        fprintf(stderr, "bcrop: destination exists; use -f to replace it: %s\n",
-                destination);
+        fprintf(stderr, "output file exists; use -f to replace it\n");
         return 2;
     }
     if (!app.force && errno != ENOENT) {
