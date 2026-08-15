@@ -20,6 +20,7 @@
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "relative-pointer-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 enum drag_mode {
@@ -57,6 +58,8 @@ struct app {
     struct wl_shm *shm;
     struct wl_seat *seat;
     struct wl_pointer *pointer;
+    struct zwp_relative_pointer_manager_v1 *relative_pointer_manager;
+    struct zwp_relative_pointer_v1 *relative_pointer;
     struct wl_keyboard *keyboard;
     struct xdg_wm_base *wm_base;
     struct wl_surface *surface;
@@ -421,7 +424,7 @@ static void draw_help(struct app *app, int width, int height)
         "F FREE   O ORIGINAL   1 SQUARE",
         "4 4:3   6 16:9   R RESET   0 FIT",
         "+/- ZOOM   ENTER SAVE   Q/ESC QUIT",
-        "LEFT CROP/MOVE/RESIZE   MIDDLE PAN   WHEEL ZOOM",
+        "LEFT CROP/MOVE/RESIZE   RIGHT PAN   WHEEL ZOOM",
     };
     int glyph_scale = app->scale;
     int pad = 8 * app->scale;
@@ -1011,8 +1014,34 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
     (void)time;
     app->pointer_x = wl_fixed_to_double(x);
     app->pointer_y = wl_fixed_to_double(y);
-    update_drag(app, app->pointer_x, app->pointer_y);
+    if (app->drag != DRAG_PAN || !app->relative_pointer)
+        update_drag(app, app->pointer_x, app->pointer_y);
 }
+
+static void relative_pointer_motion(void *data,
+                                    struct zwp_relative_pointer_v1 *relative_pointer,
+                                    uint32_t time_hi, uint32_t time_lo,
+                                    wl_fixed_t dx, wl_fixed_t dy,
+                                    wl_fixed_t dx_unaccelerated,
+                                    wl_fixed_t dy_unaccelerated)
+{
+    struct app *app = data;
+    (void)relative_pointer;
+    (void)time_hi;
+    (void)time_lo;
+    (void)dx_unaccelerated;
+    (void)dy_unaccelerated;
+
+    if (app->drag == DRAG_PAN) {
+        app->offset_x += wl_fixed_to_double(dx);
+        app->offset_y += wl_fixed_to_double(dy);
+        mark_dirty(app);
+    }
+}
+
+static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
+    .relative_motion = relative_pointer_motion,
+};
 
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
                            uint32_t time, uint32_t button, uint32_t state)
@@ -1036,13 +1065,13 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
                 app->drag_anchor_y = clamp_double(app->drag_anchor_y, 0.0,
                                                   app->image_height);
             }
-        } else if (button == BTN_MIDDLE) {
+        } else if (button == BTN_RIGHT) {
             app->drag = DRAG_PAN;
             app->drag_x = app->pointer_x;
             app->drag_y = app->pointer_y;
         }
     } else if ((button == BTN_LEFT && app->drag != DRAG_PAN) ||
-               (button == BTN_MIDDLE && app->drag == DRAG_PAN)) {
+               (button == BTN_RIGHT && app->drag == DRAG_PAN)) {
         app->drag = DRAG_NONE;
     }
 }
@@ -1150,7 +1179,18 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabil
     if ((capabilities & WL_SEAT_CAPABILITY_POINTER) && !app->pointer) {
         app->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(app->pointer, &pointer_listener, app);
+        if (app->relative_pointer_manager) {
+            app->relative_pointer =
+                zwp_relative_pointer_manager_v1_get_relative_pointer(
+                    app->relative_pointer_manager, app->pointer);
+            zwp_relative_pointer_v1_add_listener(
+                app->relative_pointer, &relative_pointer_listener, app);
+        }
     } else if (!(capabilities & WL_SEAT_CAPABILITY_POINTER) && app->pointer) {
+        if (app->relative_pointer) {
+            zwp_relative_pointer_v1_destroy(app->relative_pointer);
+            app->relative_pointer = NULL;
+        }
         wl_pointer_destroy(app->pointer);
         app->pointer = NULL;
     }
@@ -1306,6 +1346,16 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         app->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
         xdg_wm_base_add_listener(app->wm_base, &wm_base_listener, app);
+    } else if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0) {
+        app->relative_pointer_manager = wl_registry_bind(
+            registry, name, &zwp_relative_pointer_manager_v1_interface, 1);
+        if (app->pointer && !app->relative_pointer) {
+            app->relative_pointer =
+                zwp_relative_pointer_manager_v1_get_relative_pointer(
+                    app->relative_pointer_manager, app->pointer);
+            zwp_relative_pointer_v1_add_listener(
+                app->relative_pointer, &relative_pointer_listener, app);
+        }
     }
 }
 
@@ -1323,6 +1373,10 @@ static const struct wl_registry_listener registry_listener = {
 
 static void cleanup(struct app *app)
 {
+    if (app->relative_pointer)
+        zwp_relative_pointer_v1_destroy(app->relative_pointer);
+    if (app->relative_pointer_manager)
+        zwp_relative_pointer_manager_v1_destroy(app->relative_pointer_manager);
     if (app->frame_callback)
         wl_callback_destroy(app->frame_callback);
     if (app->toplevel)
